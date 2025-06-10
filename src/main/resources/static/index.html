@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Test</title>
+</head>
+<body>
+<h3>Http Stream Proxy</h3>
+
+<video id="myVideo" src="/proxy?url=http://10.121.235.6/test/video/spring_boot.mp4" autoplay controls>
+</video>
+
+<script>
+    const video = document.getElementById('myVideo');
+
+    // Monitor all video events
+    const events = [
+        'loadstart', 'progress', 'suspend', 'abort', 'error',
+        'emptied', 'stalled', 'loadedmetadata', 'loadeddata',
+        'canplay', 'canplaythrough', 'playing', 'waiting',
+        'seeking', 'seeked', 'ended', 'durationchange',
+        'timeupdate', 'play', 'pause', 'ratechange',
+        'volumechange'
+    ];
+
+    events.forEach(event => {
+        video.addEventListener(event, () => {
+            console.log(`Event: ${event}`, {
+                readyState: video.readyState,
+                networkState: video.networkState,
+                buffered: video.buffered,
+                currentTime: video.currentTime
+            });
+        });
+    });
+
+    // Check browser support
+    console.log('HTMLVideoElement' in window);
+    console.log('canPlayType' in HTMLVideoElement.prototype);
+
+    // video.addEventListener('error', function() {
+    //     const error = video.error;
+    //     console.log('Video error:', error);
+    //
+    //     switch(error.code) {
+    //         case error.MEDIA_ERR_ABORTED:
+    //             console.log('You aborted the video playback');
+    //             break;
+    //         case error.MEDIA_ERR_NETWORK:
+    //             console.log('A network error caused the video download to fail');
+    //             break;
+    //         case error.MEDIA_ERR_DECODE:
+    //             console.log('The video playback was aborted due to a corruption problem');
+    //             break;
+    //         case error.MEDIA_ERR_SRC_NOT_SUPPORTED:
+    //             console.log('The video format is not supported');
+    //             break;
+    //         default:
+    //             console.log('An unknown error occurred');
+    //             break;
+    //     }
+    // });
+</script>
+</body>
+</html>
