@@ -86,6 +86,12 @@ public class VideoStreamProxy extends NanoHTTPD {
             long totalLength = Long.parseLong(headers.get("Content-Length"));
             String contentType = headers.getOrDefault("Content-Type", "video/mp4");
 
+            if (session.getHeaders().containsKey("range")) {
+                Response response = newFixedLengthResponse(Response.Status.OK, contentType, "");
+                copyResponseHeaders(response, headers);
+                return response;
+            }
+
             String rangeHeader = session.getHeaders().getOrDefault("range", "bytes=0-");
             long rangeStart = parseRangeStart(rangeHeader);
             long rangeEnd = totalLength - 1;
@@ -100,7 +106,7 @@ public class VideoStreamProxy extends NanoHTTPD {
 
             long start = rangeStart;
             if (session.getMethod() == Method.GET) {
-                long quickStartSize = 64 * 1024;
+                long quickStartSize = 256 * 1024;
                 long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
                 Chunk firstChunk = new Chunk(-1, rangeStart, firstChunkEnd);
                 downloadChunk(videoUrl, firstChunk);
@@ -133,6 +139,7 @@ public class VideoStreamProxy extends NanoHTTPD {
                             log.info("write chunk: {}", c.id);
                             outPipe.write(c.data);
                             outPipe.flush();
+                            log.info("chunk {} sent", c.id);
                             if (c.end >= rangeEnd) {
                                 vidSession.running = false;
                                 break;
