@@ -8,6 +8,7 @@ import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
 import java.nio.channels.ReadableByteChannel;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -106,7 +107,7 @@ public class VideoStreamProxy extends NanoHTTPD {
                     inPipe, contentLength);
 
             responseHeaders(resp, headers);
-            resp.addHeader("Content-Range", "bytes " + rangeStart + "-" + totalLength + "/" + totalLength);
+            resp.addHeader("Content-Range", "bytes " + rangeStart + "-" + (totalLength - 1) + "/" + totalLength);
 
             for (int i = 0; i < vidSession.threads; i++) {
                 startWorker(vidSession, rangeStart);
@@ -160,37 +161,6 @@ public class VideoStreamProxy extends NanoHTTPD {
         }
     }
 
-    private static void startWorker(Session vidSession, long rangeStart) {
-        vidSession.executor.submit(() -> {
-            while (vidSession.running) {
-                int cid = 0;
-                try {
-                    boolean completed = false;
-                    Chunk chunk;
-                    synchronized (lock) {
-                        cid = vidSession.id++;
-                        long start = rangeStart + cid * vidSession.chunkSize;
-                        long end = start + vidSession.chunkSize - 1;
-                        if (end >= vidSession.totalLength) {
-                            end = vidSession.totalLength - 1;
-                            completed = true;
-                        }
-                        chunk = new Chunk(cid, start, end);
-                        vidSession.queue.put(chunk);
-                    }
-                    downloadChunk(vidSession.videoUrl, chunk);
-                    if (completed) {
-                        break;
-                    }
-                } catch (IOException e) {
-                    log.warn("download chunk {} failed", cid, e);
-                } catch (InterruptedException e) {
-                    break;
-                }
-            }
-        });
-    }
-
     private Map<String, String> getOriginalHeaders(String videoUrl) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(videoUrl).openConnection();
         conn.setRequestMethod("HEAD");
@@ -207,19 +177,51 @@ public class VideoStreamProxy extends NanoHTTPD {
         return headers;
     }
 
+    private static void startWorker(Session vidSession, long rangeStart) {
+        vidSession.executor.submit(() -> {
+            while (vidSession.running) {
+                int cid = 0;
+                try {
+                    boolean completed = false;
+                    Chunk chunk;
+                    synchronized (lock) {
+                        cid = vidSession.id++;
+                        long start = rangeStart + cid * vidSession.chunkSize;
+                        long end = Math.min(start + vidSession.chunkSize - 1, vidSession.totalLength - 1);
+                        completed = end == vidSession.totalLength - 1;
+                        chunk = new Chunk(cid, start, end);
+                    }
+
+                    downloadChunk(vidSession.videoUrl, chunk);
+                    vidSession.queue.put(chunk);
+
+                    if (completed) break;
+
+                } catch (IOException e) {
+                    log.warn("download chunk {} failed", cid, e);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        });
+    }
+
     private static void downloadChunk(String urlStr, Chunk chunk) throws IOException {
-        log.info("download chunk: {}", chunk.id);
+        log.info("download chunk: {} [{}-{}]", chunk.id, chunk.start, chunk.end);
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestProperty("Range", "bytes=" + chunk.start + "-" + chunk.end);
         conn.connect();
 
-        ByteBuffer buffer = ByteBuffer.allocate((int) (chunk.end - chunk.start + 1));
+        int size = (int) (chunk.end - chunk.start + 1);
+        ByteBuffer buffer = ByteBuffer.allocate(size);
         try (ReadableByteChannel channel = Channels.newChannel(conn.getInputStream())) {
-            while (channel.read(buffer) > 0) ;
+            while (buffer.hasRemaining() && channel.read(buffer) > 0) ;
         }
 
-        chunk.data = buffer.array();
+        buffer.flip();
+        chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
     }
 
     public static void main(String[] args) throws IOException {
