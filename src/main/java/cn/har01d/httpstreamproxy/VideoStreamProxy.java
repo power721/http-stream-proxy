@@ -112,9 +112,9 @@ public class VideoStreamProxy extends NanoHTTPD {
         }
 
         String id = uri.substring("/proxy/".length());
-        if (sessions.containsKey(id)) {
-            sessions.get(id).stop();
-            sessions.remove(id);
+        for (Map.Entry<String, Session> entry : sessions.entrySet()) {
+            entry.getValue().stop();
+            sessions.remove(entry.getKey());
         }
         Session session = getSession(id);
         if (session == null) {
