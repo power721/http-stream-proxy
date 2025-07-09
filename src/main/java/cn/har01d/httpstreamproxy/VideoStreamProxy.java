@@ -33,6 +33,8 @@ import fi.iki.elonen.NanoHTTPD;
 
 public class VideoStreamProxy extends NanoHTTPD {
     private static final Logger log = LoggerFactory.getLogger(VideoStreamProxy.class);
+    private static final long MIN_CHUNK_SIZE = 64 * 1024;
+    private static final long MAX_CHUNK_SIZE = 8 * 1024 * 1024;
     private final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<>();
     private final Gson gson = new Gson();
 
@@ -64,16 +66,46 @@ public class VideoStreamProxy extends NanoHTTPD {
         final ExecutorService executor;
         volatile boolean running = true;
 
+        boolean enableDynamicChunkSize;
+        volatile long dynamicChunkSize;
+        final Object chunkSizeLock = new Object();
+
+        // 滑动平均速率相关
+        final int SPEED_SAMPLES = 5;
+        final double[] speedSamples = new double[SPEED_SAMPLES];
+        int speedIndex = 0;
+        int speedCount = 0;
+
         public Session(String videoUrl, int threadCount, long chunkSize) {
             this.videoUrl = videoUrl;
             this.threadCount = threadCount;
             this.chunkSize = chunkSize;
+            this.dynamicChunkSize = chunkSize;
             this.queue = new LinkedBlockingQueue<>(threadCount);
             this.executor = Executors.newFixedThreadPool(threadCount);
         }
 
         public void stop() {
             running = false;
+        }
+
+        public void updateSpeed(double currentSpeed) {
+            synchronized (chunkSizeLock) {
+                speedSamples[speedIndex] = currentSpeed;
+                speedIndex = (speedIndex + 1) % SPEED_SAMPLES;
+                if (speedCount < SPEED_SAMPLES) speedCount++;
+            }
+        }
+
+        public double getAverageSpeed() {
+            synchronized (chunkSizeLock) {
+                if (speedCount == 0) return 0;
+                double sum = 0;
+                for (int i = 0; i < speedCount; i++) {
+                    sum += speedSamples[i];
+                }
+                return sum / speedCount;
+            }
         }
     }
 
@@ -114,13 +146,12 @@ public class VideoStreamProxy extends NanoHTTPD {
 
             log.info("GET {} Range: {} -> {} totalLength={}", uri, rangeStart, rangeEnd, totalLength);
 
-            long quickStartSize = 64 * 1024;
-            long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
+            long firstChunkEnd = Math.min(rangeStart + MIN_CHUNK_SIZE - 1, rangeEnd);
             Chunk firstChunk = new Chunk(rangeStart, firstChunkEnd);
             downloadChunk(session, firstChunk);
             log.info("Download chunk [{}-{}]", firstChunk.start, firstChunk.end);
 
-            PipedInputStream inPipe = new PipedInputStream((int) Math.max(4 * 1024 * 1024, session.chunkSize));
+            PipedInputStream inPipe = new PipedInputStream((int) Math.max(MAX_CHUNK_SIZE, session.chunkSize));
             PipedOutputStream outPipe = new PipedOutputStream(inPipe);
 
             Response response = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, contentType, inPipe, contentLength);
@@ -213,11 +244,15 @@ public class VideoStreamProxy extends NanoHTTPD {
         session.executor.submit(() -> {
             log.info("start worker thread");
             while (session.running) {
-                long start = session.nextOffset.getAndAdd(session.chunkSize);
+                long chunkSize;
+                synchronized (session.chunkSizeLock) {
+                    chunkSize = session.dynamicChunkSize;
+                }
+                long start = session.nextOffset.getAndAdd(chunkSize);
                 if (start > session.rangeEnd) {
                     break;
                 }
-                long end = Math.min(start + session.chunkSize - 1, session.rangeEnd);
+                long end = Math.min(start + chunkSize - 1, session.rangeEnd);
                 Chunk chunk = new Chunk(start, end);
 
                 try {
@@ -233,27 +268,63 @@ public class VideoStreamProxy extends NanoHTTPD {
 
     private static void downloadChunk(Session session, Chunk chunk) throws IOException {
         int retries = 3;
+
         while (retries-- > 0) {
+            long startTime = System.nanoTime();
             try {
                 HttpURLConnection conn = (HttpURLConnection) new URL(session.videoUrl).openConnection();
                 conn.setRequestProperty("Range", "bytes=" + chunk.start + "-" + chunk.end);
+                conn.setConnectTimeout(5000);
+                conn.setReadTimeout(10000);
                 conn.connect();
 
                 int size = (int) (chunk.end - chunk.start + 1);
                 ByteBuffer buffer = ByteBuffer.allocate(size);
                 try (ReadableByteChannel channel = Channels.newChannel(conn.getInputStream())) {
-                    while (buffer.hasRemaining() && channel.read(buffer) > 0) ;
+                    while (buffer.hasRemaining() && channel.read(buffer) > 0);
                 }
                 buffer.flip();
                 chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
-                log.info("downloaded chunk [{}-{}]", chunk.start, chunk.end);
+
+                long elapsedNanos = System.nanoTime() - startTime;
+                double elapsedSeconds = elapsedNanos / 1_000_000_000.0;
+                double speedKBps = (size / 1024.0) / elapsedSeconds;
+
+                session.updateSpeed(speedKBps);
+                double avgSpeed = session.getAverageSpeed();
+
+                if (session.enableDynamicChunkSize) {
+                    adjustChunkSizeBySpeed(session, avgSpeed);
+                }
+
+                log.info("downloaded chunk [{}-{}] size={} bytes in {} ms, speed={} KB/s, avgSpeed={} KB/s",
+                        chunk.start, chunk.end, size, elapsedNanos / 1_000_000.0, speedKBps, avgSpeed);
                 return;
             } catch (IOException e) {
                 log.warn("Retry download chunk [{}-{}] due to {}", chunk.start, chunk.end, e.toString());
             }
         }
+
         session.stop();
         throw new IOException("Download failed after retries for chunk [" + chunk.start + "-" + chunk.end + "]");
+    }
+
+    private static void adjustChunkSizeBySpeed(Session session, double avgSpeedKBps) {
+        final double targetDuration = 0.5; // 秒，理想下载时长
+
+        synchronized (session.chunkSizeLock) {
+            if (avgSpeedKBps <= 0) return;
+
+            long idealChunkSize = (long) (avgSpeedKBps * 1024 * targetDuration);
+
+            idealChunkSize = Math.max(MIN_CHUNK_SIZE, Math.min(MAX_CHUNK_SIZE, idealChunkSize));
+
+            if (Math.abs(session.dynamicChunkSize - idealChunkSize) >= MIN_CHUNK_SIZE) {
+                log.info("Adjusting chunk size by speed: {} -> {} bytes (avgSpeed={} KB/s)",
+                        session.dynamicChunkSize, idealChunkSize, avgSpeedKBps);
+                session.dynamicChunkSize = idealChunkSize;
+            }
+        }
     }
 
     private Map<String, String> getOriginalHeaders(String videoUrl) throws IOException {
