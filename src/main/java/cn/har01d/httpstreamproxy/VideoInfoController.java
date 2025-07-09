@@ -15,7 +15,7 @@ public class VideoInfoController {
         Map<String, Object> map = new HashMap<>();
         map.put("id", id);
         map.put("url", "http://10.121.235.6/test/video/spring_boot.mp4");
-        map.put("threads", 4);
+        map.put("concurrency", 4);
         map.put("chunkSize", 512 * 1024);
         return map;
     }

@@ -27,11 +27,14 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.google.gson.Gson;
+
 import fi.iki.elonen.NanoHTTPD;
 
 public class VideoStreamProxy extends NanoHTTPD {
     private static final Logger log = LoggerFactory.getLogger(VideoStreamProxy.class);
     private final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<>();
+    private final Gson gson = new Gson();
 
     public static class Chunk {
         final long start;
@@ -42,6 +45,12 @@ public class VideoStreamProxy extends NanoHTTPD {
             this.start = start;
             this.end = end;
         }
+    }
+
+    public static class Video {
+        String url;
+        int concurrency;
+        int chunkSize;
     }
 
     public static class Session {
@@ -191,11 +200,8 @@ public class VideoStreamProxy extends NanoHTTPD {
                     out.write(buffer, 0, len);
                 }
                 String json = out.toString();
-                String urlStr = json.split("\"url\":\"")[1].split("\"")[0];
-                int threads = Integer.parseInt(json.split("\"threads\":")[1].split(",")[0]);
-                int chunkSize = Integer.parseInt(json.split("\"chunkSize\":")[1].split(",")[0]);
-
-                return new Session(urlStr, threads, chunkSize);
+                Video video = gson.fromJson(json, Video.class);
+                return new Session(video.url, video.concurrency, video.chunkSize);
             } catch (Exception e) {
                 log.warn("Get video info failed!", e);
                 return null;
