@@ -86,6 +86,9 @@ public class VideoStreamProxy extends NanoHTTPD {
     @Override
     public Response serve(IHTTPSession httpSession) {
         String uri = httpSession.getUri();
+        if (uri.startsWith("/status")) {
+            return newFixedLengthResponse(Response.Status.OK, MIME_PLAINTEXT, "");
+        }
         if (!uri.startsWith("/proxy/")) {
             return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found");
         }
