@@ -96,7 +96,7 @@ public class VideoStreamProxy extends NanoHTTPD {
             sessions.remove(id);
         }
         Session session = getSession(id);
-        log.info("session: {}", session);
+        //log.info("session: {}", session);
 
         if (session == null) {
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, NanoHTTPD.MIME_PLAINTEXT, "Failed to init session");
@@ -112,13 +112,13 @@ public class VideoStreamProxy extends NanoHTTPD {
             long rangeEnd = parseRangeEnd(rangeHeader, totalLength - 1);
             long contentLength = rangeEnd - rangeStart + 1;
 
-            log.info("GET {} Range: {} -> {} totalLength={}", uri, rangeStart, rangeEnd, totalLength);
+            //log.info("GET {} Range: {} -> {} totalLength={}", uri, rangeStart, rangeEnd, totalLength);
 
             long quickStartSize = 64 * 1024;
             long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
             Chunk firstChunk = new Chunk(rangeStart, firstChunkEnd);
             downloadChunk(session, firstChunk);
-            log.info("Download chunk [{}-{}]", firstChunk.start, firstChunk.end);
+            //log.info("Download chunk [{}-{}]", firstChunk.start, firstChunk.end);
 
             PipedInputStream inPipe = new PipedInputStream((int) Math.max(4 * 1024 * 1024, session.chunkSize));
             PipedOutputStream outPipe = new PipedOutputStream(inPipe);
@@ -141,7 +141,7 @@ public class VideoStreamProxy extends NanoHTTPD {
 
                     outPipe.write(firstChunk.data);
                     outPipe.flush();
-                    log.info("first chunk sent");
+                    //log.info("first chunk sent");
                     long expectedOffset = firstChunk.end + 1;
 
                     while (session.running) {
@@ -153,13 +153,13 @@ public class VideoStreamProxy extends NanoHTTPD {
                         while (buffer.containsKey(expectedOffset)) {
                             Chunk c = buffer.remove(expectedOffset);
                             if (c.data == null) {
-                                log.warn("chunk [{}-{}] failed, terminating", c.start, c.end);
+                                //log.warn("chunk [{}-{}] failed, terminating", c.start, c.end);
                                 session.running = false;
                                 break;
                             }
                             outPipe.write(c.data);
                             outPipe.flush();
-                            log.info("chunk [{}-{}] sent", c.start, c.end);
+                            //log.info("chunk [{}-{}] sent", c.start, c.end);
                             expectedOffset = c.end + 1;
 
                             if (c.end >= session.rangeEnd) {
@@ -211,7 +211,7 @@ public class VideoStreamProxy extends NanoHTTPD {
 
     private void startWorker(Session session) {
         session.executor.submit(() -> {
-            log.info("start worker thread");
+            //log.info("start worker thread");
             while (session.running) {
                 long start = session.nextOffset.getAndAdd(session.chunkSize);
                 if (start > session.rangeEnd) {
@@ -246,7 +246,7 @@ public class VideoStreamProxy extends NanoHTTPD {
                 }
                 buffer.flip();
                 chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
-                log.info("downloaded chunk [{}-{}]", chunk.start, chunk.end);
+                //log.info("downloaded chunk [{}-{}]", chunk.start, chunk.end);
                 return;
             } catch (IOException e) {
                 log.warn("Retry download chunk [{}-{}] due to {}", chunk.start, chunk.end, e.toString());
