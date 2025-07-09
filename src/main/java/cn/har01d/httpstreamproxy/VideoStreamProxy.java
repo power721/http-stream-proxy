@@ -33,7 +33,7 @@ import fi.iki.elonen.NanoHTTPD;
 
 public class VideoStreamProxy extends NanoHTTPD {
     private static final Logger log = LoggerFactory.getLogger(VideoStreamProxy.class);
-    private static final long minChunkSize = 32 * 1024;
+    private static final long minChunkSize = 64 * 1024;
     private static final long maxChunkSize = 4 * 1024 * 1024;
     private static final int windowSize = 5;
 
@@ -131,7 +131,7 @@ public class VideoStreamProxy extends NanoHTTPD {
             long rangeEnd = parseRangeEnd(rangeHeader, totalLength - 1);
             long contentLength = rangeEnd - rangeStart + 1;
 
-            long quickStartSize = 64 * 1024;
+            long quickStartSize = computeQuickStartSize(totalLength);
             long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
             Chunk firstChunk = new Chunk(rangeStart, firstChunkEnd);
             downloadChunk(session, firstChunk);
@@ -192,6 +192,20 @@ public class VideoStreamProxy extends NanoHTTPD {
         } catch (Exception e) {
             log.error("serve failed", e);
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Internal error");
+        }
+    }
+
+    private static long computeQuickStartSize(long totalSize) {
+        final long MB = 1024 * 1024;
+        final long GB = 1024 * MB;
+        if (totalSize >= 2 * GB) {
+            return 256 * 1024;
+        } else if (totalSize >= 512 * MB) {
+            return 128 * 1024;
+        } else if (totalSize >= 128 * MB) {
+            return 64 * 1024;
+        } else {
+            return 32 * 1024;
         }
     }
 
