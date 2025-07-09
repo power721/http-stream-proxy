@@ -22,6 +22,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,13 +34,11 @@ public class VideoStreamProxy extends NanoHTTPD {
     private final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<>();
 
     public static class Chunk {
-        final int id;
         final long start;
         final long end;
         byte[] data;
 
-        public Chunk(int id, long start, long end) {
-            this.id = id;
+        public Chunk(long start, long end) {
             this.start = start;
             this.end = end;
         }
@@ -50,13 +49,11 @@ public class VideoStreamProxy extends NanoHTTPD {
         final long chunkSize;
         final int threadCount;
 
-        long startOffset;
         long rangeEnd;
-
+        final AtomicLong nextOffset = new AtomicLong();
         final BlockingQueue<Chunk> queue;
         final ExecutorService executor;
         volatile boolean running = true;
-        volatile int chunkId = 0;
 
         public Session(String videoUrl, int threadCount, long chunkSize) {
             this.videoUrl = videoUrl;
@@ -85,6 +82,10 @@ public class VideoStreamProxy extends NanoHTTPD {
         }
 
         String id = uri.substring("/proxy/".length());
+        if (sessions.containsKey(id)) {
+            sessions.get(id).stop();
+            sessions.remove(id);
+        }
         Session session = getSession(id);
         log.info("session: {}", session);
 
@@ -106,66 +107,65 @@ public class VideoStreamProxy extends NanoHTTPD {
 
             long quickStartSize = 64 * 1024;
             long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
-            Chunk firstChunk = new Chunk(-1, rangeStart, firstChunkEnd);
+            Chunk firstChunk = new Chunk(rangeStart, firstChunkEnd);
             downloadChunk(session, firstChunk);
-            log.info("Download chunk -1 [{}-{}]", firstChunk.start, firstChunk.end);
+            log.info("Download chunk [{}-{}]", firstChunk.start, firstChunk.end);
 
             PipedInputStream inPipe = new PipedInputStream((int) Math.max(4 * 1024 * 1024, session.chunkSize));
             PipedOutputStream outPipe = new PipedOutputStream(inPipe);
 
             Response response = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, contentType, inPipe, contentLength);
             response.addHeader("Content-Range", "bytes " + rangeStart + "-" + rangeEnd + "/" + totalLength);
-            response.addHeader("Content-Length", String.valueOf(contentLength));
             response.addHeader("Accept-Ranges", "bytes");
             response.addHeader("Access-Control-Allow-Origin", "*");
-            //response.addHeader("Connection", "close");
             copyResponseHeaders(response, headers);
 
-            log.info("write first chunk to {}", firstChunk.end);
-            outPipe.write(firstChunk.data);
-            outPipe.flush();
-            log.info("first chunk sent");
+            session.nextOffset.set(firstChunkEnd + 1);
+            session.rangeEnd = rangeEnd;
+            for (int i = 0; i < session.threadCount; i++) {
+                startWorker(session);
+            }
 
-            if (firstChunk.end < rangeEnd) {
-                session.startOffset = firstChunkEnd + 1;
-                session.rangeEnd = rangeEnd;
-                for (int i = 0; i < session.threadCount; i++) {
-                    startWorker(session);
-                }
+            new Thread(() -> {
+                try (outPipe) {
+                    Map<Long, Chunk> buffer = new TreeMap<>();
 
-                new Thread(() -> {
-                    try (outPipe) {
-                        int expectedId = 0;
-                        Map<Integer, Chunk> buffer = new TreeMap<>();
+                    outPipe.write(firstChunk.data);
+                    outPipe.flush();
+                    log.info("first chunk sent");
+                    long expectedOffset = firstChunk.end + 1;
 
-                        while (session.running) {
-                            Chunk chunk = session.queue.poll(100, TimeUnit.MILLISECONDS);
-                            if (chunk != null) {
-                                buffer.put(chunk.id, chunk);
+                    while (session.running) {
+                        Chunk chunk = session.queue.poll(100, TimeUnit.MILLISECONDS);
+                        if (chunk != null) {
+                            buffer.put(chunk.start, chunk);
+                        }
+
+                        while (buffer.containsKey(expectedOffset)) {
+                            Chunk c = buffer.remove(expectedOffset);
+                            if (c.data == null) {
+                                log.warn("chunk [{}-{}] failed, terminating", c.start, c.end);
+                                session.running = false;
+                                break;
                             }
+                            outPipe.write(c.data);
+                            outPipe.flush();
+                            log.info("chunk [{}-{}] sent", c.start, c.end);
+                            expectedOffset = c.end + 1;
 
-                            while (buffer.containsKey(expectedId)) {
-                                Chunk c = buffer.remove(expectedId++);
-                                log.info("write chunk: {} [{}-{}]", c.id, c.start, c.end);
-                                outPipe.write(c.data);
-                                outPipe.flush();
-                                log.info("chunk {} sent", c.id);
-                                if (c.end >= rangeEnd) {
-                                    session.running = false;
-                                    break;
-                                }
+                            if (c.end >= session.rangeEnd) {
+                                session.running = false;
+                                break;
                             }
                         }
-                    } catch (IOException | InterruptedException e) {
-                        log.warn("Writer error: {}", e.toString());
-                    } finally {
-                        session.running = false;
-                        session.executor.shutdownNow();
                     }
-                }, "writer").start();
-            } else {
-                outPipe.close();
-            }
+                } catch (IOException | InterruptedException e) {
+                    log.warn("Writer error: {}", e.toString());
+                } finally {
+                    session.running = false;
+                    session.executor.shutdownNow();
+                }
+            }, "writer").start();
 
             return response;
         } catch (Exception e) {
@@ -175,11 +175,6 @@ public class VideoStreamProxy extends NanoHTTPD {
     }
 
     private Session getSession(String id) {
-        if (sessions.containsKey(id)) {
-            sessions.get(id).running = false;
-            sessions.remove(id);
-        }
-
         return sessions.computeIfAbsent(id, key -> {
             try {
                 URL restApi = new URL("http://localhost:3000/api/video-info?id=" + id);
@@ -212,22 +207,18 @@ public class VideoStreamProxy extends NanoHTTPD {
         session.executor.submit(() -> {
             log.info("start worker thread");
             while (session.running) {
-                int cid;
-                synchronized (session) {
-                    cid = session.chunkId++;
-                }
-                long start = session.startOffset + (cid * session.chunkSize);
+                long start = session.nextOffset.getAndAdd(session.chunkSize);
                 if (start > session.rangeEnd) {
                     break;
                 }
                 long end = Math.min(start + session.chunkSize - 1, session.rangeEnd);
+                Chunk chunk = new Chunk(start, end);
 
-                Chunk chunk = new Chunk(cid, start, end);
                 try {
                     downloadChunk(session, chunk);
                     session.queue.put(chunk);
                 } catch (Exception e) {
-                    log.warn("Worker failed cid {}: {}", cid, e.toString());
+                    log.warn("Worker failed chunk [{}-{}]: {}", start, end, e.toString());
                     break;
                 }
             }
@@ -249,21 +240,21 @@ public class VideoStreamProxy extends NanoHTTPD {
                 }
                 buffer.flip();
                 chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
-                log.info("downloaded chunk {}", chunk.id);
+                log.info("downloaded chunk [{}-{}]", chunk.start, chunk.end);
                 return;
             } catch (IOException e) {
-                log.warn("Retry download chunk {} due to {}", chunk.id, e.toString());
+                log.warn("Retry download chunk [{}-{}] due to {}", chunk.start, chunk.end, e.toString());
             }
         }
-        session.running = false;
-        throw new IOException("Download failed after retries for chunk " + chunk.id);
+        session.stop();
+        throw new IOException("Download failed after retries for chunk [" + chunk.start + "-" + chunk.end + "]");
     }
 
     private Map<String, String> getOriginalHeaders(String videoUrl) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) new URL(videoUrl).openConnection();
         conn.setRequestMethod("HEAD");
-        conn.setConnectTimeout(3000);
-        conn.setReadTimeout(3000);
+        conn.setConnectTimeout(6000);
+        conn.setReadTimeout(6000);
         conn.connect();
 
         Map<String, String> headers = new LinkedHashMap<>();
@@ -295,8 +286,7 @@ public class VideoStreamProxy extends NanoHTTPD {
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             String key = entry.getKey();
             if (key == null) continue;
-            if (key.equalsIgnoreCase("Content-Length")
-                    || key.equalsIgnoreCase("Content-Type")
+            if (key.equalsIgnoreCase("Content-Type")
                     || key.equalsIgnoreCase("Content-Range")) {
                 continue;
             }
