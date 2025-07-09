@@ -33,6 +33,10 @@ import fi.iki.elonen.NanoHTTPD;
 
 public class VideoStreamProxy extends NanoHTTPD {
     private static final Logger log = LoggerFactory.getLogger(VideoStreamProxy.class);
+    private static final long minChunkSize = 32 * 1024;
+    private static final long maxChunkSize = 4 * 1024 * 1024;
+    private static final int windowSize = 5;
+
     private final ConcurrentMap<String, Session> sessions = new ConcurrentHashMap<>();
     private final Gson gson = new Gson();
 
@@ -59,12 +63,8 @@ public class VideoStreamProxy extends NanoHTTPD {
         final int threadCount;
         final long initialChunkSize;
         volatile long dynamicChunkSize;
-        final long minChunkSize = 32 * 1024;
-        final long maxChunkSize = 4 * 1024 * 1024;
-        final int windowSize = 5;
         final long[] speedWindow;
         int speedIndex = 0;
-        int speedCount = 0;
 
         long rangeEnd;
         final AtomicLong nextOffset = new AtomicLong();
@@ -252,29 +252,30 @@ public class VideoStreamProxy extends NanoHTTPD {
     }
 
     private void adjustChunkSize(Session session, long speedKBps) {
-        synchronized (sessions) {
-            session.speedWindow[session.speedIndex] = speedKBps;
-            session.speedIndex = (session.speedIndex + 1) % session.windowSize;
-            if (session.speedCount < session.windowSize) {
-                session.speedCount++;
+        synchronized (session) {
+            session.speedWindow[session.speedIndex % windowSize] = speedKBps;
+            session.speedIndex++;
+
+            if (session.speedIndex < windowSize) {
+                return;
             }
 
             long sum = 0;
-            for (int i = 0; i < session.speedCount; i++) {
+            for (int i = 0; i < windowSize; i++) {
                 sum += session.speedWindow[i];
             }
-            long avgSpeed = sum / session.speedCount;
+            long avgSpeed = sum / windowSize;
 
             long newChunkSize = session.dynamicChunkSize;
-
             if (avgSpeed < 200) {
-                newChunkSize = Math.max(session.minChunkSize, session.dynamicChunkSize / 2);
+                newChunkSize = Math.max(minChunkSize, session.dynamicChunkSize / 2);
             } else if (avgSpeed > 1500) {
-                newChunkSize = Math.min(session.maxChunkSize, session.dynamicChunkSize * 2);
+                newChunkSize = Math.min(maxChunkSize, session.dynamicChunkSize * 2);
             }
 
             if (newChunkSize != session.dynamicChunkSize) {
-                log.info("Adjusting chunkSize from {} → {} (avg speed={} KB/s)", session.dynamicChunkSize, newChunkSize, avgSpeed);
+                log.info("Adjusting chunkSize from {} → {} (avg speed={} KB/s)",
+                        session.dynamicChunkSize, newChunkSize, avgSpeed);
                 session.dynamicChunkSize = newChunkSize;
             }
         }
