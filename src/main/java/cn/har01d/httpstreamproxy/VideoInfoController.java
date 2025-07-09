@@ -14,9 +14,14 @@ public class VideoInfoController {
     public Map<String, Object> getVideo(String id) {
         Map<String, Object> map = new HashMap<>();
         map.put("id", id);
-        map.put("url", "http://10.121.235.6/test/video/spring_boot.mp4");
+        String url = "http://10.121.235.6/test/video/spring_boot.mp4";
+        if (id.equals("spring")) {
+            url = "http://10.121.235.6/test/video/Spring%20Boot%20Microservices.mp4";
+        }
+        map.put("url", url);
         map.put("concurrency", 4);
         map.put("chunkSize", 512 * 1024);
+        map.put("headers", Map.of("referer", "https://example.com"));
         return map;
     }
 }

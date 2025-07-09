@@ -52,16 +52,16 @@ public class VideoStreamProxy extends NanoHTTPD {
     }
 
     public static class Video {
+        String id;
         String url;
         int concurrency;
         int chunkSize;
+        Map<String, String> headers;
     }
 
     public static class Session {
-        final String id;
-        final String videoUrl;
-        final int threadCount;
-        final long initialChunkSize;
+        final Video video;
+
         volatile long dynamicChunkSize;
         final long[] speedWindow;
         int speedIndex = 0;
@@ -72,14 +72,11 @@ public class VideoStreamProxy extends NanoHTTPD {
         final ExecutorService executor;
         volatile boolean running = true;
 
-        public Session(String id, String videoUrl, int threadCount, long chunkSize) {
-            this.id = id;
-            this.videoUrl = videoUrl;
-            this.threadCount = threadCount;
-            this.initialChunkSize = chunkSize;
-            this.dynamicChunkSize = chunkSize;
-            this.queue = new LinkedBlockingQueue<>(threadCount);
-            this.executor = Executors.newFixedThreadPool(threadCount);
+        public Session(Video video) {
+            this.video = video;
+            this.dynamicChunkSize = video.chunkSize;
+            this.queue = new LinkedBlockingQueue<>(video.concurrency);
+            this.executor = Executors.newFixedThreadPool(video.concurrency);
             this.speedWindow = new long[windowSize];
         }
 
@@ -90,8 +87,8 @@ public class VideoStreamProxy extends NanoHTTPD {
         @Override
         public String toString() {
             return "Session{" +
-                    "id='" + id + '\'' +
-                    ", threads=" + threadCount +
+                    "id='" + video.id + '\'' +
+                    ", threads=" + video.concurrency +
                     ", chunkSize=" + dynamicChunkSize +
                     ", nextOffset=" + nextOffset +
                     '}';
@@ -125,7 +122,7 @@ public class VideoStreamProxy extends NanoHTTPD {
         }
 
         try {
-            Map<String, String> headers = getOriginalHeaders(session.videoUrl);
+            Map<String, String> headers = getOriginalHeaders(session.video.url);
             long totalLength = Long.parseLong(headers.get("Content-Length"));
             String contentType = headers.getOrDefault("Content-Type", "video/mp4");
 
@@ -139,7 +136,7 @@ public class VideoStreamProxy extends NanoHTTPD {
             Chunk firstChunk = new Chunk(rangeStart, firstChunkEnd);
             downloadChunk(session, firstChunk);
 
-            PipedInputStream inPipe = new PipedInputStream((int) Math.max(4 * 1024 * 1024, session.initialChunkSize));
+            PipedInputStream inPipe = new PipedInputStream((int) Math.max(maxChunkSize, session.video.chunkSize));
             PipedOutputStream outPipe = new PipedOutputStream(inPipe);
 
             Response response = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, contentType, inPipe, contentLength);
@@ -150,7 +147,7 @@ public class VideoStreamProxy extends NanoHTTPD {
 
             session.nextOffset.set(firstChunkEnd + 1);
             session.rangeEnd = rangeEnd;
-            for (int i = 0; i < session.threadCount; i++) {
+            for (int i = 0; i < session.video.concurrency; i++) {
                 startWorker(session);
             }
 
@@ -216,7 +213,7 @@ public class VideoStreamProxy extends NanoHTTPD {
                 }
                 String json = out.toString();
                 Video video = gson.fromJson(json, Video.class);
-                return new Session(id, video.url, video.concurrency, video.chunkSize);
+                return new Session(video);
             } catch (Exception e) {
                 log.warn("Get video info failed!", e);
                 return null;
@@ -285,8 +282,13 @@ public class VideoStreamProxy extends NanoHTTPD {
         int retries = 3;
         while (retries-- > 0) {
             try {
-                HttpURLConnection conn = (HttpURLConnection) new URL(session.videoUrl).openConnection();
+                HttpURLConnection conn = (HttpURLConnection) new URL(session.video.url).openConnection();
                 conn.setRequestProperty("Range", "bytes=" + chunk.start + "-" + chunk.end);
+                if (session.video.headers != null) {
+                    for (Map.Entry<String, String> entry : session.video.headers.entrySet()) {
+                        conn.setRequestProperty(entry.getKey(), entry.getValue());
+                    }
+                }
                 conn.connect();
 
                 int size = (int) (chunk.end - chunk.start + 1);
