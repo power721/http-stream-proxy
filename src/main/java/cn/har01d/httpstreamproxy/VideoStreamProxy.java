@@ -41,7 +41,7 @@ public class VideoStreamProxy extends NanoHTTPD {
         final BlockingQueue<Chunk> queue;
         final ExecutorService executor;
         volatile boolean running = true;
-        volatile int chunkId = 1;
+        volatile int chunkId = 0;
 
         public Session(String videoUrl, long startOffset, long rangeEnd, int threadCount, long chunkSize) {
             this.videoUrl = videoUrl;
@@ -61,55 +61,56 @@ public class VideoStreamProxy extends NanoHTTPD {
     }
 
     @Override
-    public Response serve(IHTTPSession session) {
-        String uri = session.getUri();
+    public Response serve(IHTTPSession httpSession) {
+        String uri = httpSession.getUri();
         if (!uri.startsWith("/proxy/")) {
             return newFixedLengthResponse(Response.Status.NOT_FOUND, MIME_PLAINTEXT, "Not found");
         }
 
         String id = uri.substring("/proxy/".length());
-        String videoUrl = "https://d.har01d.cn/AI_News.mp4";
+        int threads = 8;
+        int chunkSize = 512 * 1024;
+        //String videoUrl = "https://d.har01d.cn/AI_News.mp4";
+        String videoUrl = "http://10.121.235.6/test/video/spring_boot.mp4";
 
         try {
             Map<String, String> headers = getOriginalHeaders(videoUrl);
             long totalLength = Long.parseLong(headers.get("Content-Length"));
             String contentType = headers.getOrDefault("Content-Type", "video/mp4");
 
-            String rangeHeader = session.getHeaders().getOrDefault("range", "bytes=0-");
+            String rangeHeader = httpSession.getHeaders().getOrDefault("range", "bytes=0-");
             long rangeStart = parseRangeStart(rangeHeader);
             long rangeEnd = parseRangeEnd(rangeHeader, totalLength - 1);
             long contentLength = rangeEnd - rangeStart + 1;
 
             log.info("GET {} Range: {} -> {} totalLength={}", uri, rangeStart, rangeEnd, totalLength);
 
-            // ===== 1. 快速响应块 =====
-            long quickStartSize = 256 * 1024;
+            long quickStartSize = 64 * 1024;
             long firstChunkEnd = Math.min(rangeStart + quickStartSize - 1, rangeEnd);
             Chunk firstChunk = new Chunk(-1, rangeStart, firstChunkEnd);
             downloadChunk(videoUrl, firstChunk);
             log.info("Download chunk -1 [{}-{}]", firstChunk.start, firstChunk.end);
 
-            // ===== 2. 初始化响应流 =====
-            PipedInputStream inPipe = new PipedInputStream(512 * 1024);
+            PipedInputStream inPipe = new PipedInputStream(8 * 1024 * 1024);
             PipedOutputStream outPipe = new PipedOutputStream(inPipe);
 
             Response response = newFixedLengthResponse(Response.Status.PARTIAL_CONTENT, contentType, inPipe, contentLength);
             response.addHeader("Content-Range", "bytes " + rangeStart + "-" + rangeEnd + "/" + totalLength);
             response.addHeader("Content-Length", String.valueOf(contentLength));
             response.addHeader("Accept-Ranges", "bytes");
+            response.addHeader("Access-Control-Allow-Origin", "*");
+            //response.addHeader("Connection", "close");
             copyResponseHeaders(response, headers);
 
-            // ===== 3. 写入第一块 =====
+            log.info("write first chunk to {}", firstChunk.end);
             outPipe.write(firstChunk.data);
             outPipe.flush();
-            log.info("write first chunk to {}", firstChunk.end);
             log.info("first chunk sent");
 
-            // ===== 4. 启动异步 worker =====
             if (firstChunk.end < rangeEnd) {
-                Session vidSession = new Session(videoUrl, rangeStart, rangeEnd, 4, 512 * 1024);
-                for (int i = 0; i < vidSession.threadCount; i++) {
-                    startWorker(vidSession);
+                Session session = new Session(videoUrl, firstChunkEnd + 1, rangeEnd, threads, chunkSize);
+                for (int i = 0; i < threads; i++) {
+                    startWorker(session);
                 }
 
                 new Thread(() -> {
@@ -117,8 +118,8 @@ public class VideoStreamProxy extends NanoHTTPD {
                         int expectedId = 0;
                         Map<Integer, Chunk> buffer = new TreeMap<>();
 
-                        while (vidSession.running) {
-                            Chunk chunk = vidSession.queue.poll(100, TimeUnit.MILLISECONDS);
+                        while (session.running) {
+                            Chunk chunk = session.queue.poll(100, TimeUnit.MILLISECONDS);
                             if (chunk != null) {
                                 buffer.put(chunk.id, chunk);
                             }
@@ -130,7 +131,7 @@ public class VideoStreamProxy extends NanoHTTPD {
                                 outPipe.flush();
                                 log.info("chunk {} sent", c.id);
                                 if (c.end >= rangeEnd) {
-                                    vidSession.running = false;
+                                    session.running = false;
                                     break;
                                 }
                             }
@@ -138,15 +139,15 @@ public class VideoStreamProxy extends NanoHTTPD {
                     } catch (IOException | InterruptedException e) {
                         log.warn("Writer error: {}", e.toString());
                     } finally {
-                        vidSession.executor.shutdownNow();
+                        session.running = false;
+                        session.executor.shutdownNow();
                     }
                 }, "writer").start();
             } else {
-                outPipe.close(); // 没有更多数据了
+                outPipe.close();
             }
 
             return response;
-
         } catch (Exception e) {
             log.error("serve failed", e);
             return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Internal error");
@@ -155,15 +156,17 @@ public class VideoStreamProxy extends NanoHTTPD {
 
     private void startWorker(Session session) {
         session.executor.submit(() -> {
+            log.info("start worker thread");
             while (session.running) {
                 int cid;
-                long start, end;
                 synchronized (session) {
                     cid = session.chunkId++;
-                    start = session.startOffset + (cid * session.chunkSize) + session.chunkSize; // +skip first chunk
-                    if (start > session.rangeEnd) break;
-                    end = Math.min(start + session.chunkSize - 1, session.rangeEnd);
                 }
+                long start = session.startOffset + (cid * session.chunkSize);
+                if (start > session.rangeEnd) {
+                    break;
+                }
+                long end = Math.min(start + session.chunkSize - 1, session.rangeEnd);
 
                 Chunk chunk = new Chunk(cid, start, end);
                 try {
@@ -178,18 +181,27 @@ public class VideoStreamProxy extends NanoHTTPD {
     }
 
     private static void downloadChunk(String urlStr, Chunk chunk) throws IOException {
-        URL url = new URL(urlStr);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        conn.setRequestProperty("Range", "bytes=" + chunk.start + "-" + chunk.end);
-        conn.connect();
+        int retries = 3;
+        while (retries-- > 0) {
+            try {
+                HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                conn.setRequestProperty("Range", "bytes=" + chunk.start + "-" + chunk.end);
+                conn.connect();
 
-        int size = (int) (chunk.end - chunk.start + 1);
-        ByteBuffer buffer = ByteBuffer.allocate(size);
-        try (ReadableByteChannel channel = Channels.newChannel(conn.getInputStream())) {
-            while (buffer.hasRemaining() && channel.read(buffer) > 0) ;
+                int size = (int) (chunk.end - chunk.start + 1);
+                ByteBuffer buffer = ByteBuffer.allocate(size);
+                try (ReadableByteChannel channel = Channels.newChannel(conn.getInputStream())) {
+                    while (buffer.hasRemaining() && channel.read(buffer) > 0);
+                }
+                buffer.flip();
+                chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
+                log.info("downloaded chunk {}", chunk.id);
+                return;
+            } catch (IOException e) {
+                log.warn("Retry download chunk {} due to {}", chunk.id, e.toString());
+            }
         }
-        buffer.flip();
-        chunk.data = Arrays.copyOf(buffer.array(), buffer.limit());
+        throw new IOException("Download failed after retries for chunk " + chunk.id);
     }
 
     private Map<String, String> getOriginalHeaders(String videoUrl) throws IOException {
@@ -228,7 +240,9 @@ public class VideoStreamProxy extends NanoHTTPD {
         for (Map.Entry<String, String> entry : headers.entrySet()) {
             String key = entry.getKey();
             if (key == null) continue;
-            if (key.equalsIgnoreCase("Content-Length") || key.equalsIgnoreCase("Content-Type") || key.equalsIgnoreCase("Content-Range")) {
+            if (key.equalsIgnoreCase("Content-Length")
+                    || key.equalsIgnoreCase("Content-Type")
+                    || key.equalsIgnoreCase("Content-Range")) {
                 continue;
             }
             resp.addHeader(key, entry.getValue());
